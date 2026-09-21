@@ -62,6 +62,15 @@ def init_db() -> None:
             );
             """
         )
+        _ensure_column(conn, "items", "postponed",
+                       "postponed INTEGER NOT NULL DEFAULT 0")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Idempotent migration: add ``column`` to ``table`` when missing."""
+    cols = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +202,23 @@ def record_actual(meeting_id: int, item_id: int, actual_end: str) -> dict:
         return dict(conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
 
 
+def set_postponed(meeting_id: int, item_ids: list[int], postponed: bool = True) -> None:
+    """Atomically flag items as postponed (moved out of the meeting).
+
+    The whole batch — item updates plus the undo-log entry — commits as one
+    transaction, so a confirmed suggestion enters the undo chain as a single
+    reversible step.
+    """
+    flag = 1 if postponed else 0
+    with _lock, get_conn() as conn:
+        snapshot = _snapshot(conn, meeting_id)
+        conn.executemany(
+            "UPDATE items SET postponed = ? WHERE id = ? AND meeting_id = ?",
+            [(flag, item_id, meeting_id) for item_id in item_ids],
+        )
+        _push_undo(conn, meeting_id, "postpone", snapshot)
+
+
 def undo_last(meeting_id: int) -> bool:
     """Restore the item states captured by the most recent live entry."""
     with _lock, get_conn() as conn:
@@ -204,8 +230,8 @@ def undo_last(meeting_id: int) -> bool:
         items = json.loads(log["snapshot"])
         for it in items:
             conn.execute(
-                "UPDATE items SET actual_end = ? WHERE id = ? AND meeting_id = ?",
-                (it["actual_end"], it["id"], meeting_id))
+                "UPDATE items SET actual_end = ?, postponed = ? WHERE id = ? AND meeting_id = ?",
+                (it["actual_end"], it.get("postponed", 0), it["id"], meeting_id))
         conn.execute("DELETE FROM undo_log WHERE id = ?", (log["id"],))
         return True
 

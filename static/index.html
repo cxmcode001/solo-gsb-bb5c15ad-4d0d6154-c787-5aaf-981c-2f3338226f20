@@ -54,7 +54,7 @@
         </div>
         <div class="meeting-bar-actions">
           <span id="liveBadge" class="badge badge-off">未开始录入</span>
-          <button class="btn btn-warn" id="btnUndo" disabled>↩ 撤销最近录入</button>
+          <button class="btn btn-warn" id="btnUndo" disabled>↩ 撤销上一步</button>
           <button class="btn btn-secondary" id="btnReset" disabled>重置实况</button>
         </div>
       </section>
@@ -183,6 +183,21 @@
           <button type="submit" class="btn btn-primary">提交并重排</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- postpone suggestion modal -->
+  <div id="postponeModal" class="modal-backdrop hidden">
+    <div class="modal modal-wide">
+      <h3>🗓 延期建议（试排预览，尚未保存）</h3>
+      <div id="postponeSummary" class="postpone-summary"></div>
+      <div id="postponeList" class="table-wrap postpone-list"></div>
+      <h4>试排时间轴（延期后效果）</h4>
+      <div class="timeline" id="postponeTimeline"></div>
+      <div class="form-actions postpone-actions">
+        <button type="button" class="btn btn-secondary" id="cancelPostpone">取消</button>
+        <button type="button" class="btn btn-primary" id="confirmPostpone">确认延期并重排</button>
+      </div>
     </div>
   </div>
 

@@ -122,6 +122,7 @@ input:focus, select:focus { outline: 2px solid rgba(47, 111, 237, .25); border-c
 .pill-p4 { background: #e3f3ea; color: #24754e; }
 .pill-p5 { background: #dff0e4; color: #17633b; }
 .tag-lock { background: #ece7fa; color: #5f43b5; border-radius: 6px; padding: 1px 7px; font-size: .74rem; margin-left: 4px; }
+.tag-postpone { background: #fdeedd; color: #b06a14; border-radius: 6px; padding: 1px 7px; font-size: .74rem; margin-left: 4px; }
 .actual-val { font-weight: 700; color: var(--green); white-space: nowrap; }
 .mini-btn {
   border: 1px solid var(--line); background: #fbfcfe; border-radius: 6px;
@@ -149,6 +150,17 @@ input:focus, select:focus { outline: 2px solid rgba(47, 111, 237, .25); border-c
   border-left: 5px solid var(--green); background: #eef9f3; border-radius: 10px;
   padding: 12px 14px; font-size: .9rem; color: #207550; font-weight: 600;
 }
+.danger-banner {
+  border-left: 5px solid var(--danger); background: #fdf3f3; border-radius: 10px;
+  padding: 12px 14px; font-size: .9rem; color: var(--danger); font-weight: 600;
+}
+.conflict-actions { display: flex; align-items: center; gap: 12px; margin-top: 4px; flex-wrap: wrap; }
+
+/* postpone suggestion modal */
+.modal-wide { width: min(880px, 94vw); max-height: 92vh; overflow-y: auto; }
+.postpone-summary { margin-bottom: 12px; }
+.postpone-list { margin-bottom: 14px; }
+.postpone-actions { margin-top: 14px; }
 
 /* timeline */
 .timeline-block { margin-top: 18px; }

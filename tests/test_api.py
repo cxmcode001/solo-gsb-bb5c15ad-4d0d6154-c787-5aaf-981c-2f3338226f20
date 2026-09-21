@@ -166,6 +166,119 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual([it["id"] for it in r.json()], [b, a])
 
+    # ------------------------------------------------------------------
+    # postponement suggestions
+    # ------------------------------------------------------------------
+
+    def _make_overflowing_live_meeting(self):
+        """09:00-10:00; A done at 09:35 (25 min left). Pending:
+        B(30/10,P1) + C(25/25,P5,incompressible) -> floors 35 > 25."""
+        a = self.add_item("A", 20, 10, priority=5)
+        b = self.add_item("B", 30, 10, priority=1)
+        c = self.add_item("C", 25, 25, priority=5, incompressible=True)
+        r = self.client.post(f"/api/meetings/{self.mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:35"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(any(x["overflow_minutes"] > 0
+                            for x in r.json()["current"]["conflicts"]))
+        return a, b, c
+
+    def test_suggestion_previews_without_writing(self):
+        _, b, _ = self._make_overflowing_live_meeting()
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone-suggestion")
+        self.assertEqual(r.status_code, 200, r.text)
+        s = r.json()
+        self.assertTrue(s["feasible"])
+        self.assertEqual([p["id"] for p in s["postponed"]], [b])
+        self.assertEqual(s["remaining_overflow_minutes"], 0)
+        # trial timeline no longer contains the postponed item
+        seg_ids = {seg["id"] for seg in s["timeline"]["segments"]}
+        self.assertNotIn(b, seg_ids)
+        # nothing persisted yet
+        plan = self.client.get(f"/api/meetings/{self.mid}").json()
+        self.assertTrue(all(not it["postponed"] for it in plan["items"]))
+        self.assertTrue(any(x["overflow_minutes"] > 0
+                            for x in plan["current"]["conflicts"]))
+
+    def test_confirm_postpones_atomically_and_is_undoable(self):
+        _, b, c = self._make_overflowing_live_meeting()
+        undo_before = self.client.get(f"/api/meetings/{self.mid}").json()["undo_count"]
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone",
+                             json={"item_ids": [b]})
+        self.assertEqual(r.status_code, 200, r.text)
+        plan = r.json()
+        items = {it["id"]: it for it in plan["items"]}
+        self.assertEqual(items[b]["postponed"], 1)
+        self.assertEqual(items[c]["postponed"], 0)
+        # immediately re-scheduled: postponed item gone from both timelines,
+        # conflicts cleared
+        for tl in ("original", "current"):
+            self.assertNotIn(b, {s["id"] for s in plan[tl]["segments"]})
+        self.assertEqual(plan["current"]["conflicts"], [])
+        self.assertEqual(plan["undo_count"], undo_before + 1)
+        # undo restores the postponed item (and the conflict)
+        r = self.client.post(f"/api/meetings/{self.mid}/undo")
+        self.assertEqual(r.status_code, 200)
+        plan = r.json()
+        items = {it["id"]: it for it in plan["items"]}
+        self.assertEqual(items[b]["postponed"], 0)
+        self.assertTrue(any(x["overflow_minutes"] > 0
+                            for x in plan["current"]["conflicts"]))
+
+    def test_confirm_rejects_stale_or_wrong_item_set(self):
+        _, b, _ = self._make_overflowing_live_meeting()
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone",
+                             json={"item_ids": [999]})
+        self.assertEqual(r.status_code, 409)
+        plan = self.client.get(f"/api/meetings/{self.mid}").json()
+        self.assertTrue(all(not it["postponed"] for it in plan["items"]))
+
+    def test_infeasible_suggestion_cannot_be_confirmed(self):
+        # B is the only postponable item; removing it still leaves C (25 min,
+        # incompressible) overflowing the 25-minute remainder... use a tighter
+        # meeting: C needs 25 but only 20 remain after A ends at 09:40.
+        a = self.add_item("A", 20, 10, priority=5)
+        b = self.add_item("B", 10, 5, priority=1)
+        c = self.add_item("C", 25, 25, priority=5, incompressible=True)
+        self.client.post(f"/api/meetings/{self.mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:40"})
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone-suggestion")
+        s = r.json()
+        self.assertFalse(s["feasible"])
+        self.assertEqual([p["id"] for p in s["postponed"]], [b])
+        self.assertEqual(s["remaining_overflow_minutes"], 5)
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone",
+                             json={"item_ids": [b]})
+        self.assertEqual(r.status_code, 409)
+        plan = self.client.get(f"/api/meetings/{self.mid}").json()
+        self.assertTrue(all(not it["postponed"] for it in plan["items"]))
+
+    def test_postponed_items_are_skipped_by_recording_order(self):
+        _, b, c = self._make_overflowing_live_meeting()
+        self.client.post(f"/api/meetings/{self.mid}/postpone",
+                         json={"item_ids": [b]})
+        # recording the postponed item itself is rejected
+        r = self.client.post(f"/api/meetings/{self.mid}/actuals", json={
+            "item_id": b, "actual_end": "2026-09-21T09:50"})
+        self.assertEqual(r.status_code, 409)
+        # C may be recorded even though B (earlier in order) has no actual_end
+        r = self.client.post(f"/api/meetings/{self.mid}/actuals", json={
+            "item_id": c, "actual_end": "2026-09-21T10:00"})
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_suggestion_works_before_going_live(self):
+        # 60 planned minutes in a 60-minute meeting is fine; add 20 more -> overflow
+        self.add_item("A", 40, 20, priority=5)
+        b = self.add_item("B", 40, 20, priority=1)
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone-suggestion")
+        s = r.json()
+        self.assertTrue(s["feasible"])
+        self.assertEqual([p["id"] for p in s["postponed"]], [b])
+        r = self.client.post(f"/api/meetings/{self.mid}/postpone",
+                             json={"item_ids": [b]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["original"]["conflicts"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

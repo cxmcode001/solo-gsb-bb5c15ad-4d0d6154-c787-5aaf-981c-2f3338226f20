@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .scheduler import build_original, parse_dt, reschedule
-from .schemas import ActualIn, BreakCreate, ItemCreate, MeetingCreate, MoveIn
+from .scheduler import build_original, parse_dt, reschedule, suggest_postponement
+from .schemas import ActualIn, BreakCreate, ItemCreate, MeetingCreate, MoveIn, PostponeIn
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -36,13 +36,16 @@ def _build_plan(meeting: dict) -> dict:
     start = parse_dt(meeting["start_time"])
     end = parse_dt(meeting["end_time"])
 
-    original = build_original(start, end, items, breaks)
+    # postponed items have been moved out of the meeting: they stay visible
+    # in the agenda list but no longer occupy the timelines
+    active_items = [it for it in items if not it.get("postponed")]
+    original = build_original(start, end, active_items, breaks)
 
-    actual_items = [it for it in items if it.get("actual_end")]
+    actual_items = [it for it in active_items if it.get("actual_end")]
     live = bool(actual_items)
     if live:
         last_actual = max(parse_dt(it["actual_end"]) for it in actual_items)
-        current = reschedule(start, end, items, breaks, last_actual)
+        current = reschedule(start, end, active_items, breaks, last_actual)
     else:
         # nothing recorded yet: live plan equals the original plan
         current = {
@@ -184,14 +187,19 @@ def api_record_actual(meeting_id: int, body: ActualIn):
     item = db.get_item(body.item_id)
     if item is None or item["meeting_id"] != meeting_id:
         raise HTTPException(404, "议程项不存在")
+    if item.get("postponed"):
+        raise HTTPException(409, "该议程已延期移出本次会议，无需录入实际结束时间")
     if item.get("actual_end"):
         raise HTTPException(409, "该议程项已录入实际结束时间")
 
     items = db.list_items(meeting_id)
     ordered = sorted(items, key=lambda it: (it["sort_order"], it["id"]))
     target_pos = next(i for i, it in enumerate(ordered) if it["id"] == body.item_id)
-    prev_done = [it for it in ordered[:target_pos] if it.get("actual_end")]
-    if len(prev_done) != target_pos:
+    # postponed items are out of the meeting and never get an actual_end,
+    # so the in-order rule only applies to items still on the agenda
+    prev_active = [it for it in ordered[:target_pos] if not it.get("postponed")]
+    prev_done = [it for it in prev_active if it.get("actual_end")]
+    if len(prev_done) != len(prev_active):
         raise HTTPException(409, "请按议程顺序录入：前面尚有未完成的议程项")
 
     actual = parse_dt(body.actual_end)
@@ -220,6 +228,49 @@ def api_reset(meeting_id: int):
     if not _is_live(meeting_id):
         raise HTTPException(409, "当前没有任何实况录入")
     db.reset_actuals(meeting_id)
+    return _build_plan(db.get_meeting(meeting_id))
+
+
+# ---------------------------------------------------------------------------
+# postponement suggestions
+# ---------------------------------------------------------------------------
+
+def _postpone_suggestion(meeting: dict) -> dict:
+    """Compute a fresh postponement suggestion from the current DB state."""
+    items = db.list_items(meeting["id"])
+    breaks = db.list_breaks(meeting["id"])
+    start = parse_dt(meeting["start_time"])
+    end = parse_dt(meeting["end_time"])
+    actual_ends = [parse_dt(it["actual_end"]) for it in items if it.get("actual_end")]
+    live = bool(actual_ends)
+    anchor = max(actual_ends) if live else start
+    return suggest_postponement(start, end, items, breaks, anchor, live=live)
+
+
+@app.post("/api/meetings/{meeting_id}/postpone-suggestion")
+def api_postpone_suggestion(meeting_id: int):
+    """Preview which items to move out of the meeting. Writes nothing."""
+    meeting = _get_meeting_or_404(meeting_id)
+    return _postpone_suggestion(meeting)
+
+
+@app.post("/api/meetings/{meeting_id}/postpone")
+def api_postpone(meeting_id: int, body: PostponeIn):
+    """Confirm a previewed suggestion: save postponements atomically (one
+    undoable step) and return the immediately re-scheduled plan."""
+    meeting = _get_meeting_or_404(meeting_id)
+    suggestion = _postpone_suggestion(meeting)
+    ids = [p["id"] for p in suggestion["postponed"]]
+    if not ids:
+        raise HTTPException(409, "当前没有需要延期的议程")
+    if not suggestion["feasible"]:
+        raise HTTPException(
+            409,
+            f"即使延期全部可延期议程，仍超出 {suggestion['remaining_overflow_minutes']} 分钟，无法确认延期",
+        )
+    if set(body.item_ids) != set(ids):
+        raise HTTPException(409, "会议状态已变化，请重新生成延期建议后再确认")
+    db.set_postponed(meeting_id, ids)
     return _build_plan(db.get_meeting(meeting_id))
 
 

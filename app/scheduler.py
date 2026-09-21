@@ -392,3 +392,73 @@ def reschedule(start: datetime, end: Optional[datetime],
         "view_start": fmt_dt(start),
         "view_end": fmt_dt(view_end),
     }
+
+
+# ---------------------------------------------------------------------------
+# postponement suggestions
+# ---------------------------------------------------------------------------
+
+def suggest_postponement(start: datetime, end: Optional[datetime],
+                         items: list[dict], breaks: list[dict],
+                         anchor_raw: Any, live: bool = True) -> dict:
+    """Greedily move agenda items out of the meeting until conflicts clear.
+
+    Only *unfinished* (no ``actual_end``) and *postponable* items are ever
+    selected — fixed breaks are not items, completed items are frozen and
+    incompressible items may not leave the meeting. Starting from the
+    earliest conflicting layout, each round re-runs the scheduler (trial
+    layout); while a conflict with overflowing minutes remains, one item is
+    moved out — lowest priority first, then largest releasable planned
+    duration, then original order — until the timeline is conflict-free or
+    no candidate is left.
+
+    Nothing is persisted. The returned ``timeline`` is exactly the layout
+    that confirming the suggestion would produce, and ``feasible`` tells
+    whether all conflicts were eliminated (otherwise
+    ``remaining_overflow_minutes`` reports the leftover overtime).
+    """
+    prepped = _prep(items)
+    active = [it for it in prepped if not it.get("postponed")]
+
+    def trial(current_items: list[dict]) -> dict:
+        if live:
+            return reschedule(start, end, current_items, breaks, anchor_raw)
+        return build_original(start, end, current_items, breaks)
+
+    def hard(conflicts: list[dict]) -> list[dict]:
+        return [c for c in conflicts if c.get("overflow_minutes", 0) > 0]
+
+    plan = trial(active)
+    chosen: list[dict] = []
+    while hard(plan["conflicts"]):
+        candidates = [
+            it for it in active
+            if parse_dt(it.get("actual_end")) is None and not it["incompressible"]
+        ]
+        if not candidates:
+            break
+        candidates.sort(key=lambda it: (it["priority"], -it["planned"], it["sort_index"]))
+        pick = candidates[0]
+        chosen.append(pick)
+        active = [it for it in active if it["id"] != pick["id"]]
+        plan = trial(active)
+
+    remaining = hard(plan["conflicts"])
+    return {
+        "feasible": not remaining,
+        "postponed": [
+            {
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "planned_minutes": it["planned"],
+                "minimum_minutes": it["minimum"],
+                "priority": it["priority"],
+                "sort_order": it.get("sort_order", it["sort_index"]),
+            }
+            for it in chosen
+        ],
+        "freed_minutes": sum(it["planned"] for it in chosen),
+        "remaining_overflow_minutes": sum(c["overflow_minutes"] for c in remaining),
+        "remaining_conflicts": remaining,
+        "timeline": plan,
+    }
