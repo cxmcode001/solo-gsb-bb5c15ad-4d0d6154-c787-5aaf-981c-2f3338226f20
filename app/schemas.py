@@ -47,6 +47,10 @@ class MoveIn(BaseModel):
     direction: str = Field(pattern="^(up|down)$")
 
 
+class PostponeIn(BaseModel):
+    item_ids: list[int] = Field(min_length=1, max_length=500)
+
+
 class BreakCreate(BaseModel):
     title: str = Field(default="休息", max_length=100)
     fixed_start: str

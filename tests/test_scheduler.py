@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from app.scheduler import (
     build_original, compress_allocations, parse_dt, reschedule,
+    suggest_postponements,
 )
 
 
@@ -214,6 +215,97 @@ class TestReschedule(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertIn(2, conflicts[0]["item_ids"])
         self.assertEqual(by_id(plan)["2"]["start_time"], "09:50")
+
+
+class TestSuggestPostponements(unittest.TestCase):
+    def test_low_priority_moved_first_clears_overflow(self):
+        # A done 09:20, meeting ends 09:32 (12 min left):
+        # Lock 10 (incompressible, P5) + Lo 10/10 (P1) + Hi 10/2 (P5).
+        # Removing Lo lets Lock(10)+Hi compressed(2) fill the 12 minutes.
+        s = suggest_postponements(dt(9), dt(9, 32), [
+            item(1, "A", 10, 5, actual_end=iso(dt(9, 20))),
+            item(2, "Lock", 10, 10, priority=5, incompressible=True),
+            item(3, "Lo", 10, 10, priority=1),
+            item(4, "Hi", 10, 2, priority=5),
+        ], [], iso(dt(9, 20)))
+        self.assertTrue(s["feasible"])
+        self.assertEqual(s["item_ids"], [3])
+        self.assertEqual(s["steps"][0]["releases_minutes"], 10)
+        self.assertEqual(s["remaining_overflow_minutes"], 0)
+        segs = {x["id"]: x for x in s["trial_plan"]["segments"] if x["kind"] == "item"}
+        self.assertNotIn(3, segs)          # moved out
+        self.assertIn(2, segs)             # incompressible stays
+        self.assertIn(4, segs)
+
+    def test_releasable_planned_minutes_breaks_priority_tie(self):
+        # 30 min gap: Small 10 (no slack) + Big 20 (no slack) + Lock 10 fixed
+        # = 40 -> overflow 10; both soft items are P1, Big (releases 20) wins
+        s = suggest_postponements(dt(9), dt(9, 40), [
+            item(1, "A", 10, 5, actual_end=iso(dt(9, 10))),
+            item(2, "Small", 10, 10, priority=1),
+            item(3, "Big", 20, 20, priority=1),
+            item(4, "Lock", 10, 10, priority=1, incompressible=True),
+        ], [], iso(dt(9, 10)))
+        self.assertTrue(s["feasible"])
+        self.assertEqual(s["item_ids"], [3])
+
+    def test_original_order_breaks_final_tie(self):
+        # 25 min gap: X 10 + Y 10 (identical P2, no slack) + Lock 15 fixed
+        s = suggest_postponements(dt(9), dt(9, 35), [
+            item(1, "A", 10, 5, actual_end=iso(dt(9, 10))),
+            item(2, "X", 10, 10, priority=2),
+            item(3, "Y", 10, 10, priority=2),
+            item(4, "Lock", 15, 15, priority=1, incompressible=True),
+        ], [], iso(dt(9, 10)))
+        self.assertTrue(s["feasible"])
+        self.assertEqual(s["item_ids"], [2])
+
+    def test_incompressible_overflow_is_infeasible_with_remaining(self):
+        # only a locked item overflows the meeting end
+        s = suggest_postponements(dt(9), dt(9, 30), [
+            item(1, "A", 10, 5, actual_end=iso(dt(9, 20))),
+            item(2, "Lock", 20, 20, priority=1, incompressible=True),
+        ], [], iso(dt(9, 20)))
+        self.assertFalse(s["feasible"])
+        self.assertEqual(s["item_ids"], [])
+        self.assertEqual(s["remaining_overflow_minutes"], 10)
+        self.assertEqual(len(s["remaining_conflicts"]), 1)
+
+    def test_completed_items_never_candidates(self):
+        # A itself overran (done 09:25); only a locked item remains, overflow 5
+        s = suggest_postponements(dt(9), dt(9, 30), [
+            item(1, "A", 15, 5, actual_end=iso(dt(9, 25))),
+            item(2, "Lock", 10, 10, priority=5, incompressible=True),
+        ], [], iso(dt(9, 25)))
+        self.assertFalse(s["feasible"])
+        self.assertEqual(s["item_ids"], [])
+
+    def test_item_before_break_resolved_by_moving_item(self):
+        # anchor 09:35, break 09:40-09:50. B (10/10) cannot fit the 5-min gap
+        # even at minimum -> conflict; moving B out lets C (5/5) fill the gap.
+        s = suggest_postponements(dt(9), dt(11), [
+            item(1, "A", 20, 10, actual_end=iso(dt(9, 35))),
+            item(2, "B", 10, 10, priority=1),
+            item(3, "C", 5, 5, priority=3),
+        ], [brk(10, 9, 40, 10)], iso(dt(9, 35)))
+        self.assertTrue(s["feasible"])
+        self.assertEqual(s["item_ids"], [2])
+        self.assertEqual(s["steps"][0]["reason_type"], "item_before_break")
+        segs = {x["id"]: x for x in s["trial_plan"]["segments"] if x["kind"] == "item"}
+        self.assertNotIn(2, segs)
+        self.assertEqual(segs[3]["start_time"], "09:35")
+        self.assertEqual(segs[3]["end_time"], "09:40")
+
+    def test_already_postponed_items_absent_from_trial_plan(self):
+        plan = reschedule(dt(9), dt(10), [
+            item(1, "A", 10, 5, actual_end=iso(dt(9, 10))),
+            dict(item(2, "Gone", 20, 10), postponed=True),
+            item(3, "Keep", 20, 10),
+        ], [], iso(dt(9, 10)))
+        segs = {x["id"]: x for x in plan["segments"] if x["kind"] == "item"}
+        self.assertNotIn(2, segs)
+        self.assertEqual(segs[3]["start_time"], "09:10")
+        self.assertEqual(plan["conflicts"], [])
 
 
 if __name__ == "__main__":

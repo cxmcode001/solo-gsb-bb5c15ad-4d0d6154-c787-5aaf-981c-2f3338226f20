@@ -166,6 +166,167 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual([it["id"] for it in r.json()], [b, a])
 
+    # ------------------------------------------------------------------ postponements
+    def test_preview_requires_live_and_conflict(self):
+        a = self.add_item("A", 20, 10)
+        # not live -> 409
+        self.assertEqual(
+            self.client.post(f"/api/meetings/{self.mid}/postponements/preview").status_code,
+            409)
+        # live but everything fits -> 409
+        r = self.client.post(f"/api/meetings/{self.mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:20"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            self.client.post(f"/api/meetings/{self.mid}/postponements/preview").status_code,
+            409)
+
+    def _make_overrun_meeting(self, end="2026-09-21T09:32"):
+        r = self.client.post("/api/meetings", json={
+            "title": "短会", "start_time": "2026-09-21T09:00", "end_time": end})
+        mid = r.json()["id"]
+        a = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "A", "planned_minutes": 10, "minimum_minutes": 5,
+            "priority": 5}).json()["id"]
+        lock = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "Lock", "planned_minutes": 10, "minimum_minutes": 10,
+            "priority": 5, "incompressible": True}).json()["id"]
+        lo = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "Lo", "planned_minutes": 10, "minimum_minutes": 10,
+            "priority": 1}).json()["id"]
+        hi = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "Hi", "planned_minutes": 10, "minimum_minutes": 2,
+            "priority": 5}).json()["id"]
+        self.client.post(f"/api/meetings/{mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:20"})
+        return mid, a, lock, lo, hi
+
+    def test_postpone_preview_confirm_and_reschedule(self):
+        # A done 09:20; 12 minutes remain for Lock(10)+Lo(10)+Hi(10/2);
+        # removing Lo (P1) lets Lock(10) + Hi compressed (2) fill the gap
+        mid, a, lock, lo, hi = self._make_overrun_meeting()
+        r = self.client.post(f"/api/meetings/{mid}/postponements/preview")
+        self.assertEqual(r.status_code, 200, r.text)
+        s = r.json()
+        self.assertTrue(s["feasible"])
+        self.assertEqual(s["item_ids"], [lo])
+        # preview writes nothing
+        before = self.client.get(f"/api/meetings/{mid}").json()
+        self.assertFalse(any(it["id"] == lo and it["postponed"]
+                             for it in before["items"]))
+        # confirm: atomic save + immediate reschedule
+        r = self.client.post(f"/api/meetings/{mid}/postponements", json={
+            "item_ids": [lo]})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["undo_count"], 2)  # actual + postpone
+        self.assertTrue(any(it["id"] == lo and it["postponed"] for it in data["items"]))
+        seg_ids = {x["id"] for x in data["current"]["segments"] if x["kind"] == "item"}
+        self.assertNotIn(lo, seg_ids)
+        self.assertIn(hi, seg_ids)
+        self.assertIn(lock, seg_ids)
+        hard = [c for c in data["current"]["conflicts"]
+                if c["type"] in ("overflow", "item_before_break")]
+        self.assertEqual(hard, [])
+        # the postpone enters the undo chain
+        r = self.client.post(f"/api/meetings/{mid}/undo")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertFalse(any(it["postponed"] for it in data["items"]))
+
+    def test_confirm_rejected_when_overflow_remains(self):
+        r = self.client.post("/api/meetings", json={
+            "title": "短会", "start_time": "2026-09-21T09:00",
+            "end_time": "2026-09-21T09:30"})
+        mid = r.json()["id"]
+        a = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "A", "planned_minutes": 10, "minimum_minutes": 5}).json()["id"]
+        lock = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "Lock", "planned_minutes": 20, "minimum_minutes": 20,
+            "incompressible": True}).json()["id"]
+        self.client.post(f"/api/meetings/{mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:20"})
+        r = self.client.post(f"/api/meetings/{mid}/postponements/preview")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["feasible"])
+        self.assertEqual(r.json()["remaining_overflow_minutes"], 10)
+        # the locked item cannot be submitted as a postponement
+        r = self.client.post(f"/api/meetings/{mid}/postponements", json={
+            "item_ids": [lock]})
+        self.assertEqual(r.status_code, 422)
+
+    def test_cannot_postpone_completed_or_incompressible(self):
+        a = self.add_item("A", 10, 5)
+        lock = self.add_item("Lock", 20, 20, incompressible=True)
+        self.client.post(f"/api/meetings/{self.mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:50"})
+        self.assertEqual(self.client.post(
+            f"/api/meetings/{self.mid}/postponements",
+            json={"item_ids": [a]}).status_code, 422)
+        self.assertEqual(self.client.post(
+            f"/api/meetings/{self.mid}/postponements",
+            json={"item_ids": [lock]}).status_code, 422)
+
+    def test_postponed_items_skipped_in_ordered_recording(self):
+        # 09:00-09:45 meeting: A done 09:20 (25 min left); B 30/30 (P1) +
+        # C 10/10 = 40 -> overflow 15; B alone removed leaves 10 <= 25
+        r = self.client.post("/api/meetings", json={
+            "title": "短会", "start_time": "2026-09-21T09:00",
+            "end_time": "2026-09-21T09:45"})
+        mid = r.json()["id"]
+        a = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "A", "planned_minutes": 10, "minimum_minutes": 5,
+            "priority": 5}).json()["id"]
+        b = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "B", "planned_minutes": 30, "minimum_minutes": 30,
+            "priority": 1}).json()["id"]
+        c = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "C", "planned_minutes": 10, "minimum_minutes": 10,
+            "priority": 5}).json()["id"]
+        self.client.post(f"/api/meetings/{mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:20"})
+        r = self.client.post(f"/api/meetings/{mid}/postponements/preview")
+        self.assertEqual(r.json()["item_ids"], [b])
+        r = self.client.post(f"/api/meetings/{mid}/postponements",
+                             json={"item_ids": [b]})
+        self.assertEqual(r.status_code, 200, r.text)
+        # recording C directly is allowed because B is deferred; recording B
+        # itself is rejected
+        r = self.client.post(f"/api/meetings/{mid}/actuals", json={
+            "item_id": c, "actual_end": "2026-09-21T09:40"})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(f"/api/meetings/{mid}/actuals", json={
+            "item_id": b, "actual_end": "2026-09-21T09:45"})
+        self.assertEqual(r.status_code, 409)
+
+    def test_reset_clears_postponed_flags(self):
+        # 09:00-09:25: A done 09:20 (5 min left); B 20/20 alone -> overflow 15
+        r = self.client.post("/api/meetings", json={
+            "title": "短会", "start_time": "2026-09-21T09:00",
+            "end_time": "2026-09-21T09:25"})
+        mid = r.json()["id"]
+        a = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "A", "planned_minutes": 10, "minimum_minutes": 5}).json()["id"]
+        b = self.client.post(f"/api/meetings/{mid}/items", json={
+            "title": "B", "planned_minutes": 20, "minimum_minutes": 20,
+            "priority": 1}).json()["id"]
+        self.client.post(f"/api/meetings/{mid}/actuals", json={
+            "item_id": a, "actual_end": "2026-09-21T09:20"})
+        r = self.client.post(f"/api/meetings/{mid}/postponements/preview")
+        self.assertEqual(r.json()["item_ids"], [b])
+        r = self.client.post(f"/api/meetings/{mid}/postponements",
+                             json={"item_ids": [b]})
+        self.assertEqual(r.status_code, 200)
+        r = self.client.post(f"/api/meetings/{mid}/reset")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(any(it["postponed"] for it in r.json()["items"]))
+        # single undo restores both actuals and postponements
+        r = self.client.post(f"/api/meetings/{mid}/undo")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertTrue(data["live"])
+        self.assertTrue(any(it["id"] == b and it["postponed"] for it in data["items"]))
+
 
 if __name__ == "__main__":
     unittest.main()

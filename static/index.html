@@ -186,6 +186,24 @@
     </div>
   </div>
 
+  <!-- postponement-suggestion modal -->
+  <div id="suggestModal" class="modal-backdrop hidden">
+    <div class="modal modal-wide">
+      <h3>生成延期建议（试排预览）</h3>
+      <p class="muted">仅针对未完成且可压缩的议程，从最早冲突开始反复试排；固定休息、已完成与不可压缩项不会被移出。</p>
+      <div id="suggestBody"></div>
+      <div id="suggestStatus"></div>
+      <div class="trial-timeline-wrap">
+        <h4>试排时间轴（确认后生效）</h4>
+        <div class="timeline" id="suggestTimeline"></div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-secondary" id="cancelSuggest">取消</button>
+        <button type="button" class="btn btn-primary" id="btnSuggestConfirm" disabled>确认延期并重排</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/static/app.js"></script>

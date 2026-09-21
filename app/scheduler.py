@@ -60,6 +60,7 @@ def _prep(items: list[dict]) -> list[dict]:
         it["minimum"] = int(raw.get("minimum_minutes") or 0)
         it["priority"] = int(raw.get("priority") or 0)
         it["incompressible"] = bool(raw.get("incompressible"))
+        it["postponed"] = bool(raw.get("postponed"))
         out.append(it)
     return out
 
@@ -275,10 +276,12 @@ def _schedule_block(block_items, block_start, boundary, final_end,
 
 def reschedule(start: datetime, end: Optional[datetime],
                items: list[dict], breaks: list[dict],
-               anchor_raw: Any) -> dict:
+               anchor_raw: Any, exclude_ids: Optional[set] = None) -> dict:
     """Re-plan every pending agenda item from the recorded anchor time.
 
     * Items with an ``actual_end`` are completed and never move.
+    * Pending items flagged ``postponed`` (or whose id is in ``exclude_ids``)
+      are dropped from this meeting's live plan entirely.
     * Fixed breaks before the anchor are marked completed; a break that
       contains the anchor is flagged ``anchor_overlap`` and the effective
       anchor moves to its end.
@@ -290,12 +293,15 @@ def reschedule(start: datetime, end: Optional[datetime],
     items = _prep(items)
     breaks = _prep_breaks(breaks)
     recorded_anchor = parse_dt(anchor_raw)
+    excluded = set(exclude_ids or ())
 
     segments: list[dict] = []
     conflicts: list[dict] = []
 
     completed = [it for it in items if parse_dt(it.get("actual_end")) is not None]
-    pending = [it for it in items if parse_dt(it.get("actual_end")) is None]
+    pending = [it for it in items
+               if parse_dt(it.get("actual_end")) is None
+               and not it.get("postponed") and it["id"] not in excluded]
 
     # --- completed items: frozen, laid out from meeting start --------------
     cursor = start
@@ -391,4 +397,112 @@ def reschedule(start: datetime, end: Optional[datetime],
         "planned_end": fmt_dt(live_end),
         "view_start": fmt_dt(start),
         "view_end": fmt_dt(view_end),
+    }
+
+
+# ---------------------------------------------------------------------------
+# postponement suggestions (trial scheduling, writes nothing)
+# ---------------------------------------------------------------------------
+
+# Conflicts that postponing an agenda item can resolve. ``anchor_overlap`` is
+# only an informational warning and never blocks a postponement proposal.
+HARD_CONFLICT_TYPES = ("overflow", "item_before_break")
+
+
+def _hard_conflicts(conflicts: list[dict]) -> list[dict]:
+    return [c for c in conflicts if c.get("type") in HARD_CONFLICT_TYPES]
+
+
+def _remaining_overflow(conflicts: list[dict]) -> int:
+    return sum(int(c.get("overflow_minutes") or 0) for c in _hard_conflicts(conflicts))
+
+
+def _conflict_boundary(c: dict) -> datetime:
+    """Sort key: the time wall the conflict is measured against."""
+    parsed = parse_dt(c.get("boundary")) if c.get("boundary") else None
+    return parsed or datetime.max
+
+
+def _item_brief(it: dict) -> dict:
+    return {
+        "id": it["id"],
+        "title": it.get("title", ""),
+        "planned_minutes": it["planned"],
+        "minimum_minutes": it["minimum"],
+        "priority": it["priority"],
+        "incompressible": it["incompressible"],
+    }
+
+
+def suggest_postponements(start: datetime, end: Optional[datetime],
+                          items: list[dict], breaks: list[dict],
+                          anchor: Any) -> dict:
+    """Repeatedly trial-schedule, moving one candidate out of this meeting.
+
+    Only unfinished, non-postponed, *compressible* agenda items are
+    candidates; fixed breaks, completed items and incompressible items are
+    never removed. Starting from the earliest hard conflict, the candidate
+    chosen at each round is the lowest priority first, then the one releasing
+    the most planned minutes, then the one appearing earliest in the original
+    order. The loop stops as soon as all hard conflicts are cleared or no
+    candidate remains.
+
+    The function never mutates its inputs and writes nothing; the returned
+    trial plan shows exactly what the live plan would look like after the
+    proposed postponements.
+    """
+    prepped = _prep(items)
+    by_id = {it["id"]: it for it in prepped}
+    anchor_dt = parse_dt(anchor)
+    done_ids = {it["id"] for it in prepped if parse_dt(it.get("actual_end")) is not None}
+
+    def postponable(i):
+        return (i["id"] not in done_ids and not i.get("postponed")
+                and not i["incompressible"])
+
+    def trial(excluded):
+        return reschedule(start, end, prepped, breaks, anchor_dt, excluded)
+
+    excluded: set = set()
+    steps: list[dict] = []
+    plan = trial(excluded)
+    initial = _hard_conflicts(plan["conflicts"])
+
+    while True:
+        hard = _hard_conflicts(plan["conflicts"])
+        if not hard:
+            break
+        earliest = min(hard, key=_conflict_boundary)
+
+        # Candidates that actually take part in this conflict. For an
+        # item-before-break conflict that is just the single item unable to
+        # fit the gap; for an end-overflow conflict it is every remaining
+        # (already packed) item in the final block.
+        involved = {i for i in earliest.get("item_ids", []) if i in by_id}
+        candidates = [by_id[i] for i in involved if postponable(by_id[i])]
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda it: (it["priority"], -it["planned"],
+                                        it["sort_index"]))
+        pick = candidates[0]
+        excluded.add(pick["id"])
+        steps.append({
+            "item": _item_brief(pick),
+            "reason_type": earliest["type"],
+            "reason": earliest["title"],
+            "releases_minutes": pick["planned"],
+        })
+        plan = trial(excluded)
+
+    remaining = _hard_conflicts(plan["conflicts"])
+    return {
+        "feasible": not remaining,
+        "item_ids": [s["item"]["id"] for s in steps],
+        "steps": steps,
+        "remaining_conflicts": remaining,
+        "remaining_overflow_minutes": _remaining_overflow(remaining),
+        "initial_hard_conflict_count": len(initial),
+        "anchor": plan["anchor"],
+        "trial_plan": plan,
     }

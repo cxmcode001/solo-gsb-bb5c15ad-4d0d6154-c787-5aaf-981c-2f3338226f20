@@ -150,6 +150,24 @@ input:focus, select:focus { outline: 2px solid rgba(47, 111, 237, .25); border-c
   padding: 12px 14px; font-size: .9rem; color: #207550; font-weight: 600;
 }
 
+/* postponement suggestions */
+.suggest-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line);
+}
+.tag-postponed {
+  background: #ece7fa; color: #5f43b5; border-radius: 6px;
+  padding: 1px 7px; font-size: .74rem; margin-left: 4px;
+}
+.postponed-val { font-weight: 700; color: #5f43b5; white-space: nowrap; }
+tr.row-postponed td { color: var(--muted); }
+tr.row-postponed strong { color: #8a7fb5; }
+
+.modal-wide { width: min(880px, 95vw); max-height: 92vh; overflow-y: auto; }
+.trial-timeline-wrap { margin: 14px 0 4px 96px; }
+.trial-timeline-wrap h4 { margin: 0 0 8px; font-size: .9rem; }
+.trial-timeline-wrap .timeline { padding: 8px 0; }
+
 /* timeline */
 .timeline-block { margin-top: 18px; }
 .timeline-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }

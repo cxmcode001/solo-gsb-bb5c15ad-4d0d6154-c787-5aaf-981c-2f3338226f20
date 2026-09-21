@@ -3,6 +3,7 @@
 const state = {
   plan: null,
   meetings: [],
+  suggestion: null,
   currentId: localStorage.getItem("agenda_mtg") ? Number(localStorage.getItem("agenda_mtg")) : null,
 };
 
@@ -139,6 +140,10 @@ function renderMeetingBar() {
   $("#btnReset").disabled = !p.live;
 }
 
+function hardConflictsOf(plan) {
+  return plan.conflicts.filter((c) => c.type === "overflow" || c.type === "item_before_break");
+}
+
 function renderConflicts() {
   const p = state.plan;
   const panel = $("#conflictPanel");
@@ -152,7 +157,8 @@ function renderConflicts() {
     return;
   }
   panel.classList.remove("hidden");
-  panel.innerHTML = all.map((c) => {
+  const canSuggest = p.live && hardConflictsOf(p.current).length > 0;
+  const cards = all.map((c) => {
     const warn = c.kind === "anchor_overlap";
     const badge = c.overflow_minutes > 0
       ? `<span class="over-badge">超出 ${c.overflow_minutes} 分钟</span>` : "";
@@ -161,6 +167,14 @@ function renderConflicts() {
       <p>${c.message}</p>
     </div>`;
   }).join("");
+  panel.innerHTML = cards + (canSuggest ? `
+    <div class="suggest-bar">
+      <button class="btn btn-primary" id="btnSuggest">🧹 生成延期建议</button>
+      <span class="muted">从最早的冲突开始试排：仅移出未完成、可压缩的议程（低优先级、释放计划时长多者优先）。</span>
+    </div>` : "");
+  if (canSuggest) {
+    $("#btnSuggest").addEventListener("click", openSuggestionModal);
+  }
 }
 
 function priorityPill(pri) {
@@ -176,13 +190,17 @@ function renderItemTable() {
     return;
   }
   const ordered = [...p.items].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
-  const firstPending = ordered.find((it) => !it.actual_end);
+  const firstPending = ordered.find((it) => !it.actual_end && !it.postponed);
   tbody.innerHTML = ordered.map((it, i) => {
-    const attrs = it.incompressible
-      ? `<span class="tag-lock">🔒 不可压缩</span>` : `<span class="muted">可压缩</span>`;
+    const attrs = it.postponed
+      ? `<span class="tag-postponed">⏭ 已延期</span>`
+      : it.incompressible
+        ? `<span class="tag-lock">🔒 不可压缩</span>` : `<span class="muted">可压缩</span>`;
     let actions;
     if (it.actual_end) {
       actions = `<span class="muted">已完成</span>`;
+    } else if (it.postponed) {
+      actions = `<span class="muted">已移出本次会议</span>`;
     } else {
       const canRecord = p.live ? it.id === firstPending?.id : i === 0;
       actions = `
@@ -193,14 +211,15 @@ function renderItemTable() {
         <button class="mini-btn" data-act="down" data-id="${it.id}" ${i === ordered.length - 1 || p.live ? "disabled" : ""}>↓</button>
         <button class="btn-danger-mini" data-act="del" data-id="${it.id}" ${p.live ? "disabled" : ""}>删除</button>`;
     }
-    return `<tr>
+    return `<tr class="${it.postponed ? "row-postponed" : ""}">
       <td>${i + 1}</td>
       <td><strong>${escapeHtml(it.title)}</strong>${attrs}</td>
       <td>${it.planned_minutes}′</td>
       <td>${it.minimum_minutes}′</td>
       <td>${priorityPill(it.priority)}</td>
-      <td>${it.incompressible ? "保持计划时长" : "可压缩至最短"}</td>
-      <td>${it.actual_end ? `<span class="actual-val">${hm(it.actual_end)}</span>` : "—"}</td>
+      <td>${it.postponed ? "已延期" : it.incompressible ? "保持计划时长" : "可压缩至最短"}</td>
+      <td>${it.actual_end ? `<span class="actual-val">${hm(it.actual_end)}</span>`
+        : it.postponed ? `<span class="postponed-val">延期</span>` : "—"}</td>
       <td>${actions}</td>
     </tr>`;
   }).join("");
@@ -487,6 +506,102 @@ $("#btnReset").addEventListener("click", async () => {
     renderAll();
     toast("已重置实况");
   } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// --------------------------------------------------------------------------- postponement suggestions
+async function openSuggestionModal() {
+  const modal = $("#suggestModal");
+  $("#suggestBody").innerHTML = `<p class="muted">正在反复试排…</p>`;
+  $("#btnSuggestConfirm").disabled = true;
+  modal.classList.remove("hidden");
+  let s;
+  try {
+    s = await api("POST", `/api/meetings/${state.currentId}/postponements/preview`);
+  } catch (err) {
+    $("#suggestBody").innerHTML = "";
+    modal.classList.add("hidden");
+    toast(err.message, true);
+    return;
+  }
+  state.suggestion = s;
+  renderSuggestion(s);
+}
+
+function renderSuggestion(s) {
+  const body = $("#suggestBody");
+  if (!s.steps.length) {
+    body.innerHTML = `<div class="conflict-card">
+      <h4>⚠ 没有可移出的候选议程</h4>
+      <p>固定休息、已完成项与不可压缩项均不能移出，冲突无法通过延期消解。</p>
+    </div>`;
+  } else {
+    const rows = s.steps.map((st, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td><strong>${escapeHtml(st.item.title)}</strong></td>
+        <td>${priorityPill(st.item.priority)}</td>
+        <td>${st.item.planned_minutes}′</td>
+        <td class="muted">${escapeHtml(st.reason)}</td>
+      </tr>`).join("");
+    body.innerHTML = `
+      <p class="hint">以下议程将被移出本次会议（按试排顺序），共 <strong>${s.steps.length}</strong> 项，
+        释放计划时长 <strong>${s.steps.reduce((n, st) => n + st.releases_minutes, 0)}</strong> 分钟。
+        本预览不写入数据库。</p>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>#</th><th>延期项目</th><th>优先级</th><th>释放时长</th><th>移出原因</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  if (s.feasible && s.steps.length) {
+    $("#suggestStatus").innerHTML = `<div class="ok-banner">
+      ✅ 延期后冲突清零，预计结束于 ${fullLabel(s.trial_plan.planned_end)}。确认后立即重排，并可在撤销链中回退。
+    </div>`;
+  } else {
+    const over = s.remaining_overflow_minutes;
+    const detail = s.remaining_conflicts.map((c) =>
+      `<li>${escapeHtml(c.title)}：<strong>超出 ${c.overflow_minutes} 分钟</strong></li>`).join("");
+    $("#suggestStatus").innerHTML = `<div class="conflict-card">
+      <h4>⛔ 仍无法消除冲突，剩余超时合计 ${over} 分钟</h4>
+      <ul style="margin:6px 0 0;padding-left:18px">${detail}</ul>
+      <p style="margin-top:6px">确认按钮已禁用：固定休息、已完成项与不可压缩项不可移出。</p>
+    </div>`;
+  }
+
+  // trial timeline
+  const tl = $("#suggestTimeline");
+  tl.innerHTML = "";
+  renderTimeline(tl, s.trial_plan, {
+    endLabel: "会议结束",
+    endTime: state.plan.meeting.end_time,
+    anchor: s.anchor,
+  });
+
+  $("#btnSuggestConfirm").disabled = !(s.feasible && s.steps.length);
+}
+
+$("#cancelSuggest").addEventListener("click", () => $("#suggestModal").classList.add("hidden"));
+$("#suggestModal").addEventListener("click", (e) => {
+  if (e.target.id === "suggestModal") $("#suggestModal").classList.add("hidden");
+});
+
+$("#btnSuggestConfirm").addEventListener("click", async () => {
+  const s = state.suggestion;
+  if (!s) return;
+  $("#btnSuggestConfirm").disabled = true;
+  try {
+    state.plan = await api("POST", `/api/meetings/${state.currentId}/postponements`, {
+      item_ids: s.item_ids,
+    });
+    $("#suggestModal").classList.add("hidden");
+    renderAll();
+    toast(`已延期 ${s.item_ids.length} 项并完成重排，冲突已清零`);
+  } catch (err) {
+    $("#btnSuggestConfirm").disabled = false;
     toast(err.message, true);
   }
 });

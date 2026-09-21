@@ -42,7 +42,8 @@ def init_db() -> None:
                 priority INTEGER NOT NULL DEFAULT 3,
                 incompressible INTEGER NOT NULL DEFAULT 0,
                 sort_order INTEGER NOT NULL DEFAULT 0,
-                actual_end TEXT
+                actual_end TEXT,
+                postponed INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS breaks (
@@ -62,6 +63,11 @@ def init_db() -> None:
             );
             """
         )
+        # migrate databases created before the postponement feature
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+        if "postponed" not in cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN postponed INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +212,9 @@ def undo_last(meeting_id: int) -> bool:
             conn.execute(
                 "UPDATE items SET actual_end = ? WHERE id = ? AND meeting_id = ?",
                 (it["actual_end"], it["id"], meeting_id))
+            conn.execute(
+                "UPDATE items SET postponed = ? WHERE id = ? AND meeting_id = ?",
+                (1 if it.get("postponed") else 0, it["id"], meeting_id))
         conn.execute("DELETE FROM undo_log WHERE id = ?", (log["id"],))
         return True
 
@@ -214,8 +223,32 @@ def reset_actuals(meeting_id: int) -> None:
     with _lock, get_conn() as conn:
         snapshot = _snapshot(conn, meeting_id)
         _push_undo(conn, meeting_id, "reset", snapshot)
-        conn.execute("UPDATE items SET actual_end = NULL WHERE meeting_id = ?",
-                     (meeting_id,))
+        conn.execute(
+            "UPDATE items SET actual_end = NULL, postponed = 0 WHERE meeting_id = ?",
+            (meeting_id,))
+
+
+def postpone_items(meeting_id: int, item_ids: list[int]) -> None:
+    """Atomically mark items as postponed (deferred out of this meeting).
+
+    One undo entry is pushed for the whole batch so a single undo restores
+    every item (and any earlier postponement state) at once.
+    """
+    if not item_ids:
+        raise ValueError("no items to postpone")
+    unique_ids = list(dict.fromkeys(item_ids))
+    with _lock, get_conn() as conn:
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = conn.execute(
+            f"SELECT id FROM items WHERE meeting_id = ? AND id IN ({placeholders})",
+            (meeting_id, *unique_ids)).fetchall()
+        if len(rows) != len(unique_ids):
+            raise LookupError("some items not found")
+        snapshot = _snapshot(conn, meeting_id)
+        conn.execute(
+            f"UPDATE items SET postponed = 1 WHERE meeting_id = ? AND id IN ({placeholders})",
+            (meeting_id, *unique_ids))
+        _push_undo(conn, meeting_id, "postpone", snapshot)
 
 
 def undo_count(meeting_id: int) -> int:

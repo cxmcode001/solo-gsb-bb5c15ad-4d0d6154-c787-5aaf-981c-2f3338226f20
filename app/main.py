@@ -10,8 +10,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .scheduler import build_original, parse_dt, reschedule
-from .schemas import ActualIn, BreakCreate, ItemCreate, MeetingCreate, MoveIn
+from .scheduler import (
+    build_original, parse_dt, reschedule, suggest_postponements,
+)
+from .schemas import (
+    ActualIn, BreakCreate, ItemCreate, MeetingCreate, MoveIn, PostponeIn,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -76,6 +80,20 @@ def _get_meeting_or_404(meeting_id: int) -> dict:
 
 def _is_live(meeting_id: int) -> bool:
     return any(it.get("actual_end") for it in db.list_items(meeting_id))
+
+
+def _live_anchor(items: list[dict]):
+    actual_items = [it for it in items if it.get("actual_end")]
+    return max(parse_dt(it["actual_end"]) for it in actual_items)
+
+
+def _build_suggestion(meeting: dict) -> dict:
+    """Trial postponement proposal for the current live state (no writes)."""
+    items = db.list_items(meeting["id"])
+    breaks = db.list_breaks(meeting["id"])
+    start = parse_dt(meeting["start_time"])
+    end = parse_dt(meeting["end_time"])
+    return suggest_postponements(start, end, items, breaks, _live_anchor(items))
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +204,18 @@ def api_record_actual(meeting_id: int, body: ActualIn):
         raise HTTPException(404, "议程项不存在")
     if item.get("actual_end"):
         raise HTTPException(409, "该议程项已录入实际结束时间")
+    if item.get("postponed"):
+        raise HTTPException(409, "该议程项已延期移出本次会议，请先撤销延期")
 
     items = db.list_items(meeting_id)
     ordered = sorted(items, key=lambda it: (it["sort_order"], it["id"]))
     target_pos = next(i for i, it in enumerate(ordered) if it["id"] == body.item_id)
-    prev_done = [it for it in ordered[:target_pos] if it.get("actual_end")]
-    if len(prev_done) != target_pos:
+    # postponed items are deferred out of this meeting and skipped when
+    # enforcing in-order live recording
+    prev_active = [it for it in ordered[:target_pos]
+                   if it.get("actual_end") or not it.get("postponed")]
+    prev_done = [it for it in prev_active if it.get("actual_end")]
+    if len(prev_done) != len(prev_active):
         raise HTTPException(409, "请按议程顺序录入：前面尚有未完成的议程项")
 
     actual = parse_dt(body.actual_end)
@@ -220,6 +244,62 @@ def api_reset(meeting_id: int):
     if not _is_live(meeting_id):
         raise HTTPException(409, "当前没有任何实况录入")
     db.reset_actuals(meeting_id)
+    return _build_plan(db.get_meeting(meeting_id))
+
+
+# ---------------------------------------------------------------------------
+# postponement suggestions (延期建议)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/meetings/{meeting_id}/postponements/preview")
+def api_preview_postponements(meeting_id: int):
+    """Trial-schedule a postponement proposal; persists nothing."""
+    meeting = _get_meeting_or_404(meeting_id)
+    if not _is_live(meeting_id):
+        raise HTTPException(409, "会议尚未开始录入，没有需要延期消解的冲突")
+    suggestion = _build_suggestion(meeting)
+    if suggestion["initial_hard_conflict_count"] == 0:
+        raise HTTPException(409, "当前没有冲突，无需延期")
+    return suggestion
+
+
+@app.post("/api/meetings/{meeting_id}/postponements")
+def api_confirm_postponements(meeting_id: int, body: PostponeIn):
+    """Atomically persist the postponement and immediately re-schedule."""
+    meeting = _get_meeting_or_404(meeting_id)
+    if not _is_live(meeting_id):
+        raise HTTPException(409, "会议尚未开始录入，不能延期议程")
+
+    items = db.list_items(meeting_id)
+    by_id = {it["id"]: it for it in items}
+    ids = list(dict.fromkeys(body.item_ids))  # de-dup, keep order
+    for iid in ids:
+        it = by_id.get(iid)
+        if it is None or it["meeting_id"] != meeting_id:
+            raise HTTPException(404, f"议程项 {iid} 不存在")
+        if it.get("actual_end"):
+            raise HTTPException(422, f"「{it['title']}」已完成，不能延期")
+        if it.get("incompressible"):
+            raise HTTPException(422, f"「{it['title']}」不可压缩，不能移出本次会议")
+        if it.get("postponed"):
+            raise HTTPException(422, f"「{it['title']}」已处于延期状态")
+
+    # Re-verify with the exact submitted set: confirmation is only allowed
+    # when the trial run clears every hard conflict.
+    start = parse_dt(meeting["start_time"])
+    end = parse_dt(meeting["end_time"])
+    breaks = db.list_breaks(meeting_id)
+    trial = suggest_postponements(start, end, items, breaks, _live_anchor(items))
+    proposed = set(trial["item_ids"])
+    if set(ids) != proposed:
+        raise HTTPException(422, "提交的延期项目与系统建议不一致，请重新生成建议")
+    if not trial["feasible"]:
+        raise HTTPException(
+            409,
+            f"延期后仍超出 {trial['remaining_overflow_minutes']} 分钟，无法确认延期",
+        )
+
+    db.postpone_items(meeting_id, ids)
     return _build_plan(db.get_meeting(meeting_id))
 
 
